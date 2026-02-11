@@ -7,6 +7,7 @@ namespace FoleyBridgeSolutions\KotapayCashier\Services;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Http\Client\ConnectionException;
 use FoleyBridgeSolutions\KotapayCashier\Exceptions\KotapayException;
 
 class ApiClient
@@ -268,6 +269,28 @@ class ApiClient
             try {
                 $this->checkRateLimit();
                 return $this->request($method, $endpoint, $data, $query);
+            } catch (ConnectionException $e) {
+                $attempts++;
+
+                Log::warning('Kotapay API connection error', [
+                    'attempt' => $attempts,
+                    'max_attempts' => $maxAttempts,
+                    'endpoint' => $endpoint,
+                    'error' => $e->getMessage(),
+                ]);
+
+                if ($attempts >= $maxAttempts) {
+                    throw new KotapayException(
+                        'Kotapay API connection failed after ' . $attempts . ' attempts: ' . $e->getMessage(),
+                        [],
+                        0,
+                        $e
+                    );
+                }
+
+                // Exponential backoff: 100ms, 200ms, 400ms...
+                $sleepMs = $delayMs * pow(2, $attempts - 1);
+                usleep($sleepMs * 1000);
             } catch (KotapayException $e) {
                 $lastException = $e;
                 $attempts++;
