@@ -320,11 +320,24 @@ class PaymentService
     }
 
     /**
-     * Sanitize account name (remove potentially dangerous characters).
+     * Sanitize account name for Kotapay API compliance.
+     *
+     * Kotapay requires account names to be non-empty, max 21 characters,
+     * and only contain allowed characters. Based on observed API behavior,
+     * only alphanumeric characters, spaces, and hyphens are reliably accepted.
      */
     protected function sanitizeAccountName(string $name): string
     {
-        // Keep alphanumeric, spaces, and common punctuation
-        return preg_replace('/[^a-zA-Z0-9\s\-\.,\'&]/', '', $name);
+        // Keep only alphanumeric, spaces, and hyphens (Kotapay rejects punctuation like commas, apostrophes)
+        $sanitized = preg_replace('/[^a-zA-Z0-9\s\-]/', '', $name);
+
+        // Collapse multiple spaces into single space and trim
+        $sanitized = preg_replace('/\s+/', ' ', trim($sanitized));
+
+        // Truncate to Kotapay's 21-character limit
+        $sanitized = substr($sanitized, 0, 21);
+
+        // Trim any trailing non-alphanumeric chars left after truncation
+        return rtrim($sanitized, " \-");
     }
 }
