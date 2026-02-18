@@ -105,7 +105,7 @@ class PaymentService
             Log::info('Kotapay ACH payment created', [
                 'amount' => $paymentData['amount'],
                 'account_name' => $paymentData['account_name'],
-                'transaction_id' => $response['data']['transactionId'] ?? null,
+                'transaction_id' => $response['data']['TransactionId'] ?? $response['data']['transactionId'] ?? null,
                 'idempotency_key' => $idempotencyKey,
             ]);
 
@@ -183,7 +183,21 @@ class PaymentService
             $companyId = $this->api->getCompanyId();
             $response = $this->api->delete("/v1/Ach/{$companyId}/payment/void/{$transactionId}");
 
-            Log::info('Kotapay payment voided', ['transaction_id' => $transactionId]);
+            // Validate the API response status - Kotapay may return HTTP 200 with a failure in the body
+            $responseStatus = $response['status'] ?? null;
+            if ($responseStatus === 'fail' || $responseStatus === 'error') {
+                $message = $response['message'] ?? 'Kotapay void rejected';
+                $errors = $response['data'] ?? [];
+                throw new PaymentFailedException(
+                    "Kotapay void rejected: {$message}".(! empty($errors) ? ' - '.json_encode($errors) : ''),
+                    $response
+                );
+            }
+
+            Log::info('Kotapay payment voided', [
+                'transaction_id' => $transactionId,
+                'response' => $response,
+            ]);
 
             return $response;
         } catch (\Exception $e) {
