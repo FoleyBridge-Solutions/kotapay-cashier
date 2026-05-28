@@ -235,6 +235,76 @@ class ReportService
         return $this->parseReportResponse($response);
     }
 
+    /**
+     * Get every Processed Batch entry across all batches in a date range.
+     *
+     * Convenience composition: calls getProcessedBatchesSummary() to
+     * discover which BatchUniqueIDs exist in the requested range, then
+     * sequentially fetches getProcessedBatchDetail() for each one and
+     * flattens the entries into a single ['rowCount', 'rows'] result.
+     *
+     * Each returned entry row is enriched with three columns carried
+     * over from the summary so the caller can group / filter / link
+     * back without a second join:
+     *  - `BatchUniqueID` (int)
+     *  - `BatchEffectiveDate` (string, summary's EffectiveDate)
+     *  - `BatchOriginalFileName` (string)
+     *
+     * Hard-capped via $maxBatches to protect against runaway fan-outs
+     * on very large date ranges. When the cap is exceeded, throws
+     * KotapayException so callers can surface a "narrow the date
+     * range" message instead of silently truncating.
+     *
+     * @param  string  $startDate  Start date in Y-m-d format
+     * @param  string  $endDate  End date in Y-m-d format
+     * @param  int  $maxBatches  Maximum batches to fan out across
+     * @return array Structured report data with 'rowCount' and 'rows' keys
+     *
+     * @throws KotapayException
+     */
+    public function getProcessedBatchDetailRange(
+        string $startDate,
+        string $endDate,
+        int $maxBatches = 200,
+    ): array {
+        $summary = $this->getProcessedBatchesSummary($startDate, $endDate);
+        $batches = $summary['rows'] ?? [];
+
+        if (count($batches) > $maxBatches) {
+            throw new KotapayException(sprintf(
+                'Processed batch detail range exceeded fan-out cap (%d batches found, max %d). Narrow the date range.',
+                count($batches),
+                $maxBatches,
+            ));
+        }
+
+        $rows = [];
+        foreach ($batches as $batch) {
+            $batchId = (int) ($batch['BatchUniqueID'] ?? 0);
+            if ($batchId <= 0) {
+                continue;
+            }
+
+            $detail = $this->getProcessedBatchDetail($batchId);
+            foreach ($detail['rows'] ?? [] as $entry) {
+                $entry['BatchUniqueID'] = $batchId;
+                $entry['BatchEffectiveDate'] = $batch['EffectiveDate'] ?? null;
+                $entry['BatchOriginalFileName'] = $batch['OriginalFileName'] ?? null;
+                $rows[] = $entry;
+            }
+        }
+
+        return [
+            'rowCount' => count($rows),
+            'rows' => $rows,
+            'raw' => [
+                'batches_scanned' => count($batches),
+                'startDate' => $startDate,
+                'endDate' => $endDate,
+            ],
+        ];
+    }
+
     // =========================================================================
     // File Acknowledgement Report (far)
     // =========================================================================
