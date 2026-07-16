@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Http\Client\ConnectionException;
 use FoleyBridgeSolutions\KotapayCashier\Exceptions\KotapayException;
+use FoleyBridgeSolutions\KotapayCashier\Exceptions\AmbiguousPaymentOutcomeException;
 
 class ApiClient
 {
@@ -187,12 +188,18 @@ class ApiClient
      *
      * @param  string  $endpoint
      * @param  array  $data
+     * @param  bool  $retryOnConnectionError  Set false for non-idempotent
+     *         money-movement calls where a client-side timeout leaves the
+     *         outcome ambiguous — a blind retry risks a duplicate real-world
+     *         charge if the first attempt actually landed. When false, a
+     *         timeout throws AmbiguousPaymentOutcomeException immediately
+     *         instead of resending the request.
      * @return array
      * @throws KotapayException
      */
-    public function post(string $endpoint, array $data = []): array
+    public function post(string $endpoint, array $data = [], bool $retryOnConnectionError = true): array
     {
-        return $this->requestWithRetry('POST', $endpoint, $data);
+        return $this->requestWithRetry('POST', $endpoint, $data, [], $retryOnConnectionError);
     }
 
     /**
@@ -253,10 +260,11 @@ class ApiClient
      * @param  string  $endpoint
      * @param  array  $data
      * @param  array  $query
+     * @param  bool  $retryOnConnectionError  See post().
      * @return array
      * @throws KotapayException
      */
-    protected function requestWithRetry(string $method, string $endpoint, array $data = [], array $query = []): array
+    protected function requestWithRetry(string $method, string $endpoint, array $data = [], array $query = [], bool $retryOnConnectionError = true): array
     {
         $retryEnabled = config('kotapay.retry.enabled', true);
         $maxAttempts = $retryEnabled ? config('kotapay.retry.max_attempts', 3) : 1;
@@ -278,6 +286,15 @@ class ApiClient
                     'endpoint' => $endpoint,
                     'error' => $e->getMessage(),
                 ]);
+
+                if (!$retryOnConnectionError) {
+                    throw new AmbiguousPaymentOutcomeException(
+                        'Kotapay API connection timed out with an unknown outcome for a non-retryable request: ' . $e->getMessage(),
+                        [],
+                        0,
+                        $e
+                    );
+                }
 
                 if ($attempts >= $maxAttempts) {
                     throw new KotapayException(
