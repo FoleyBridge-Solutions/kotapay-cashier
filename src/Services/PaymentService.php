@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace FoleyBridgeSolutions\KotapayCashier\Services;
 
+use FoleyBridgeSolutions\KotapayCashier\Exceptions\AmbiguousPaymentOutcomeException;
 use FoleyBridgeSolutions\KotapayCashier\Exceptions\PaymentFailedException;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
@@ -87,7 +88,11 @@ class PaymentService
 
         try {
             $companyId = $this->api->getCompanyId();
-            $response = $this->api->post("/v1/Ach/{$companyId}/payment", $payload);
+            // ACH origination is not safe to blind-retry: a client-side
+            // timeout doesn't tell us whether Kotapay already accepted and
+            // originated the debit, and retrying an ambiguous outcome can
+            // produce a real duplicate charge (see AmbiguousPaymentOutcomeException).
+            $response = $this->api->post("/v1/Ach/{$companyId}/payment", $payload, retryOnConnectionError: false);
 
             Log::info('Kotapay raw API response', $response);
 
@@ -110,6 +115,11 @@ class PaymentService
             ]);
 
             return $response;
+        } catch (AmbiguousPaymentOutcomeException $e) {
+            // Must not be re-wrapped as an ordinary PaymentFailedException:
+            // callers need to distinguish "definitely failed, safe to retry"
+            // from "outcome unknown, do not retry without manual verification."
+            throw $e;
         } catch (\Exception $e) {
             throw new PaymentFailedException(
                 'Kotapay payment failed: '.$e->getMessage(),

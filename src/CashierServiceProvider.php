@@ -6,6 +6,7 @@ namespace FoleyBridgeSolutions\KotapayCashier;
 
 use Illuminate\Support\ServiceProvider;
 use FoleyBridgeSolutions\KotapayCashier\Services\ApiClient;
+use FoleyBridgeSolutions\KotapayCashier\Services\AutomatedReport\AutomatedReportClient;
 use FoleyBridgeSolutions\KotapayCashier\Services\PaymentService;
 
 class CashierServiceProvider extends ServiceProvider
@@ -36,6 +37,12 @@ class CashierServiceProvider extends ServiceProvider
         $this->app->singleton(PaymentService::class, function ($app) {
             return new PaymentService(
                 $app->make(ApiClient::class)
+            );
+        });
+
+        $this->app->singleton(AutomatedReportClient::class, function ($app) {
+            return new AutomatedReportClient(
+                config('kotapay.auto_report', [])
             );
         });
     }

@@ -235,6 +235,76 @@ class ReportService
         return $this->parseReportResponse($response);
     }
 
+    /**
+     * Get every Processed Batch entry across all batches in a date range.
+     *
+     * Convenience composition: calls getProcessedBatchesSummary() to
+     * discover which BatchUniqueIDs exist in the requested range, then
+     * sequentially fetches getProcessedBatchDetail() for each one and
+     * flattens the entries into a single ['rowCount', 'rows'] result.
+     *
+     * Each returned entry row is enriched with three columns carried
+     * over from the summary so the caller can group / filter / link
+     * back without a second join:
+     *  - `BatchUniqueID` (int)
+     *  - `BatchEffectiveDate` (string, summary's EffectiveDate)
+     *  - `BatchOriginalFileName` (string)
+     *
+     * Hard-capped via $maxBatches to protect against runaway fan-outs
+     * on very large date ranges. When the cap is exceeded, throws
+     * KotapayException so callers can surface a "narrow the date
+     * range" message instead of silently truncating.
+     *
+     * @param  string  $startDate  Start date in Y-m-d format
+     * @param  string  $endDate  End date in Y-m-d format
+     * @param  int  $maxBatches  Maximum batches to fan out across
+     * @return array Structured report data with 'rowCount' and 'rows' keys
+     *
+     * @throws KotapayException
+     */
+    public function getProcessedBatchDetailRange(
+        string $startDate,
+        string $endDate,
+        int $maxBatches = 200,
+    ): array {
+        $summary = $this->getProcessedBatchesSummary($startDate, $endDate);
+        $batches = $summary['rows'] ?? [];
+
+        if (count($batches) > $maxBatches) {
+            throw new KotapayException(sprintf(
+                'Processed batch detail range exceeded fan-out cap (%d batches found, max %d). Narrow the date range.',
+                count($batches),
+                $maxBatches,
+            ));
+        }
+
+        $rows = [];
+        foreach ($batches as $batch) {
+            $batchId = (int) ($batch['BatchUniqueID'] ?? 0);
+            if ($batchId <= 0) {
+                continue;
+            }
+
+            $detail = $this->getProcessedBatchDetail($batchId);
+            foreach ($detail['rows'] ?? [] as $entry) {
+                $entry['BatchUniqueID'] = $batchId;
+                $entry['BatchEffectiveDate'] = $batch['EffectiveDate'] ?? null;
+                $entry['BatchOriginalFileName'] = $batch['OriginalFileName'] ?? null;
+                $rows[] = $entry;
+            }
+        }
+
+        return [
+            'rowCount' => count($rows),
+            'rows' => $rows,
+            'raw' => [
+                'batches_scanned' => count($batches),
+                'startDate' => $startDate,
+                'endDate' => $endDate,
+            ],
+        ];
+    }
+
     // =========================================================================
     // File Acknowledgement Report (far)
     // =========================================================================
@@ -375,6 +445,248 @@ class ReportService
             0,
             $lastException
         );
+    }
+
+    // =========================================================================
+    // Processor Billing Amounts (ProcessorBillingAmounts endpoint)
+    // =========================================================================
+
+    /**
+     * Get the Processor Billing Amounts report from Kotapay.
+     *
+     * Calls POST /v1/Reports/ProcessorBillingAmounts with a bill date
+     * and master key. This is a dedicated endpoint (not a /{type} call),
+     * so it's wrapped separately from runReport().
+     *
+     * @param  string  $billDate  Bill date in Y-m-d format
+     * @param  int  $masterKey  Master key identifying the processor account
+     * @return array Structured report data with 'rowCount' and 'rows' keys
+     *
+     * @throws KotapayException
+     */
+    public function getProcessorBillingAmounts(string $billDate, int $masterKey): array
+    {
+        $params = [
+            'billDate' => $billDate.'T00:00:00',
+            'masterKey' => $masterKey,
+        ];
+
+        try {
+            $response = $this->api->post('/v1/Reports/ProcessorBillingAmounts', $params);
+
+            Log::info('Kotapay ProcessorBillingAmounts executed', [
+                'params' => $params,
+                'response_status' => $response['status'] ?? null,
+            ]);
+        } catch (KotapayException $e) {
+            Log::error('Kotapay ProcessorBillingAmounts failed', [
+                'params' => $params,
+                'error' => $e->getMessage(),
+            ]);
+
+            throw $e;
+        }
+
+        $responseStatus = $response['status'] ?? null;
+        if ($responseStatus === 'fail' || $responseStatus === 'error') {
+            $message = $response['message'] ?? 'Unknown error';
+
+            throw new KotapayException("ProcessorBillingAmounts report failed: {$message}");
+        }
+
+        return $this->parseReportResponse($response);
+    }
+
+    // =========================================================================
+    // Total Company Returns (tcr)
+    // =========================================================================
+
+    /**
+     * Get the Total Company Returns report from Kotapay.
+     *
+     * Aggregated return totals across the entire company for the date
+     * range. One row per company.
+     *
+     * @param  string  $startDate  Y-m-d
+     * @param  string  $endDate  Y-m-d
+     * @return array{rowCount:int, rows:array<int, array<string, mixed>>, raw:array}
+     *
+     * @throws KotapayException
+     */
+    public function getTotalCompanyReturns(string $startDate, string $endDate): array
+    {
+        $resp = $this->runReport('tcr', [
+            'startDate' => $startDate.'T00:00:00',
+            'endDate' => $endDate.'T23:59:59',
+            'isTest' => false,
+            'reportFormat' => 'JSON',
+        ]);
+        $this->assertNotError($resp, 'Total Company Returns');
+
+        return $this->parseReportResponse($resp);
+    }
+
+    // =========================================================================
+    // Client Address (cad)
+    // =========================================================================
+
+    /**
+     * Get the Client Address report from Kotapay.
+     *
+     * One row per company contact with their on-file mailing address.
+     * Does NOT require a date range — Kotapay returns the current
+     * address roster regardless of dates, but the API still accepts them.
+     *
+     * @return array{rowCount:int, rows:array<int, array<string, mixed>>, raw:array}
+     *
+     * @throws KotapayException
+     */
+    public function getClientAddresses(): array
+    {
+        $resp = $this->runReport('cad', [
+            'isTest' => false,
+            'reportFormat' => 'JSON',
+        ]);
+        $this->assertNotError($resp, 'Client Address');
+
+        return $this->parseReportResponse($resp);
+    }
+
+    // =========================================================================
+    // Company Applications (cap)
+    // =========================================================================
+
+    /**
+     * Get the Company Applications report from Kotapay.
+     *
+     * One row per ACH application (CCD, PPD, WEB, etc.) configured for
+     * the company, with batch/entry/daily limits and funding window
+     * settings.
+     *
+     * @return array{rowCount:int, rows:array<int, array<string, mixed>>, raw:array}
+     *
+     * @throws KotapayException
+     */
+    public function getCompanyApplications(): array
+    {
+        $resp = $this->runReport('cap', [
+            'isTest' => false,
+            'reportFormat' => 'JSON',
+        ]);
+        $this->assertNotError($resp, 'Company Applications');
+
+        return $this->parseReportResponse($resp);
+    }
+
+    // =========================================================================
+    // Active Company (car)
+    // =========================================================================
+
+    /**
+     * Get the Active Company report from Kotapay.
+     *
+     * Company activity status — last activity date, start date, contract
+     * type, TIN verification flag, inactive flag, etc. One row per
+     * company on the login.
+     *
+     * @return array{rowCount:int, rows:array<int, array<string, mixed>>, raw:array}
+     *
+     * @throws KotapayException
+     */
+    public function getActiveCompany(): array
+    {
+        $resp = $this->runReport('car', [
+            'isTest' => false,
+            'reportFormat' => 'JSON',
+        ]);
+        $this->assertNotError($resp, 'Active Company');
+
+        return $this->parseReportResponse($resp);
+    }
+
+    // =========================================================================
+    // Monthly Billing Detail (mbd)
+    // =========================================================================
+
+    /**
+     * Get the Monthly Billing Detail report from Kotapay.
+     *
+     * Detailed statement of monthly billing charges. Updated several
+     * times a day on the Kotapay side. The endpoint may return a
+     * server-side generation error if called outside their daily
+     * generation window — the failure is propagated as a KotapayException.
+     *
+     * @param  string  $startDate  Y-m-d
+     * @param  string  $endDate  Y-m-d
+     * @return array{rowCount:int, rows:array<int, array<string, mixed>>, raw:array}
+     *
+     * @throws KotapayException
+     */
+    public function getMonthlyBillingDetail(string $startDate, string $endDate): array
+    {
+        $resp = $this->runReport('mbd', [
+            'startDate' => $startDate.'T00:00:00',
+            'endDate' => $endDate.'T23:59:59',
+            'isTest' => false,
+            'reportFormat' => 'JSON',
+        ]);
+        $this->assertNotError($resp, 'Monthly Billing Detail');
+
+        return $this->parseReportResponse($resp);
+    }
+
+    // =========================================================================
+    // Monthly Billing Summary (mbs)
+    // =========================================================================
+
+    /**
+     * Get the Monthly Billing Summary report from Kotapay.
+     *
+     * Summary of monthly billing charges. Updated several times a day.
+     * Same caveat as getMonthlyBillingDetail() — Kotapay may return a
+     * generation error outside their update window.
+     *
+     * @param  string  $startDate  Y-m-d
+     * @param  string  $endDate  Y-m-d
+     * @return array{rowCount:int, rows:array<int, array<string, mixed>>, raw:array}
+     *
+     * @throws KotapayException
+     */
+    public function getMonthlyBillingSummary(string $startDate, string $endDate): array
+    {
+        $resp = $this->runReport('mbs', [
+            'startDate' => $startDate.'T00:00:00',
+            'endDate' => $endDate.'T23:59:59',
+            'isTest' => false,
+            'reportFormat' => 'JSON',
+        ]);
+        $this->assertNotError($resp, 'Monthly Billing Summary');
+
+        return $this->parseReportResponse($resp);
+    }
+
+    /**
+     * Throw a KotapayException when the API responded with status=fail
+     * or status=error. Centralized so every wrapper method handles it
+     * the same way.
+     *
+     * @throws KotapayException
+     */
+    protected function assertNotError(array $response, string $reportLabel): void
+    {
+        $status = $response['status'] ?? null;
+        if ($status === 'fail' || $status === 'error') {
+            $msg = $response['message'] ?? null;
+            if ($msg === null || $msg === '') {
+                $data = $response['data'] ?? null;
+                if (is_array($data) && isset($data[0]['message'])) {
+                    $msg = $data[0]['message'];
+                } elseif (is_array($data) && isset($data['message'])) {
+                    $msg = $data['message'];
+                }
+            }
+            throw new KotapayException("{$reportLabel} report failed: ".($msg ?: 'Unknown error'));
+        }
     }
 
     // =========================================================================
